@@ -1,0 +1,78 @@
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form
+from fastapi.responses import JSONResponse
+
+from ..detector import run_inference
+
+import base64
+import io
+import re
+from typing import Optional
+from starlette.datastructures import UploadFile as StarletteUploadFile
+
+router = APIRouter()
+
+# Helper: build an UploadFile from a base64 string (supports raw b64 or data URLs)
+def _upload_from_b64(b64_str: str) -> StarletteUploadFile:
+    # Trim whitespace/newlines
+    s = b64_str.strip()
+    mime = "application/octet-stream"
+
+    # data URL? e.g., data:image/png;base64,AAAA...
+    m = re.match(r"^data:([^;]+);base64,(.*)$", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        mime = m.group(1)
+        s = m.group(2)
+
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid base64 data: {e}")
+
+    bio = io.BytesIO(raw)
+    bio.seek(0)
+    return StarletteUploadFile(filename="upload", file=bio, content_type=mime)
+
+
+@router.post("/detect")
+async def detect(
+    file: Optional[UploadFile] = File(None),
+    file_b64: Optional[str] = Form(None),
+):
+    try:
+        upload: Optional[UploadFile] = file
+        if upload is None:
+            if file_b64:
+                upload = _upload_from_b64(file_b64)
+            else:
+                raise HTTPException(status_code=422, detail="Missing file upload or file_b64 form field")
+
+        results = run_inference(upload)
+        return JSONResponse(content=results)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/isnude")
+async def isnude(
+    file: Optional[UploadFile] = File(None),
+    file_b64: Optional[str] = Form(None),
+):
+    try:
+        upload: Optional[UploadFile] = file
+        if upload is None:
+            if file_b64:
+                upload = _upload_from_b64(file_b64)
+            else:
+                raise HTTPException(status_code=422, detail="Missing file upload or file_b64 form field")
+
+        results = run_inference(upload)
+        # Expect results like {"<something>": {"label": "nude" | "safe", ...}}
+        first = next(iter(results.values())) if isinstance(results, dict) and results else {}
+        label = first.get("label", "unknown") if isinstance(first, dict) else "unknown"
+        return {"nude": label == "nude"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

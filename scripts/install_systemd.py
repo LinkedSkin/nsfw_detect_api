@@ -21,7 +21,7 @@ def main():
         Type=simple
         User=pi
         WorkingDirectory={cwd}
-        ExecStart={pdm_path} run run
+        ExecStart={pdm_path} run serve
         Restart=always
         RestartSec=5
         Environment=PYTHONUNBUFFERED=1

@@ -5,7 +5,7 @@
 groups = ["default"]
 strategy = ["inherit_metadata"]
 lock_version = "4.5.0"
-content_hash = "sha256:320b4ca86c6842df8dede17aaabc7e45cb23b9dc79dda57a0deabe60bc89c462"
+content_hash = "sha256:cdee1057dbb78ee4cba16ee89a6525bb9c9fc9de4beda21ecde1d7304e3dd738"
 
 [[metadata.targets]]
 requires_python = ">=3.13,<3.14"
@@ -303,6 +303,22 @@ dependencies = [
 files = [
     {file = "fastapi_cloud_cli-0.1.5-py3-none-any.whl", hash = "sha256:d80525fb9c0e8af122370891f9fa83cf5d496e4ad47a8dd26c0496a6c85a012a"},
     {file = "fastapi_cloud_cli-0.1.5.tar.gz", hash = "sha256:341ee585eb731a6d3c3656cb91ad38e5f39809bf1a16d41de1333e38635a7937"},
+]
+
+[[package]]
+name = "fastapi-login"
+version = "1.10.3"
+requires_python = "<4.0,>=3.8"
+summary = "Flask-Login like package for FastAPI"
+groups = ["default"]
+dependencies = [
+    "fastapi",
+    "pyjwt>=2.4",
+    "typing-extensions<5.0.0,>=4.1.1",
+]
+files = [
+    {file = "fastapi_login-1.10.3-py3-none-any.whl", hash = "sha256:4a88a5e82f35084075d22191173fa9ddc195c96647f984114a066dd93c067067"},
+    {file = "fastapi_login-1.10.3.tar.gz", hash = "sha256:f0db92f59bc7dfa301dfe8fa5914062ff1582efc2f56b51ca5e23dde4edf8c27"},
 ]
 
 [[package]]
@@ -917,6 +933,17 @@ groups = ["default"]
 files = [
     {file = "pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b"},
     {file = "pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887"},
+]
+
+[[package]]
+name = "pyjwt"
+version = "2.10.1"
+requires_python = ">=3.9"
+summary = "JSON Web Token implementation in Python"
+groups = ["default"]
+files = [
+    {file = "PyJWT-2.10.1-py3-none-any.whl", hash = "sha256:dcdd193e30abefd5debf142f9adfcdd2b58004e644f25406ffaebd50bd98dacb"},
+    {file = "pyjwt-2.10.1.tar.gz", hash = "sha256:3cc5772eb20009233caf06e9d8a0577824723b44e6648ee0a2aedb6cf9381953"},
 ]
 
 [[package]]

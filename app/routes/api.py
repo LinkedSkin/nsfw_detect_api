@@ -77,6 +77,6 @@ async def isnude(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/list_labels")
+@router.get("/list_labels")
 async def list_labels():
     return JSONResponse(content={"all_labels": all_labels, 'naughty_labels': naughty_labels})

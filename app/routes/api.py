@@ -1,7 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 
-from ..detector import run_inference
+from ..detector import run_inference, all_labels, naughty_labels
 
 import base64
 import io
@@ -68,11 +68,15 @@ async def isnude(
                 raise HTTPException(status_code=422, detail="Missing file upload or file_b64 form field")
 
         results = run_inference(upload)
-        # Expect results like {"<something>": {"label": "nude" | "safe", ...}}
-        first = next(iter(results.values())) if isinstance(results, dict) and results else {}
-        label = first.get("label", "unknown") if isinstance(first, dict) else "unknown"
-        return {"nude": label == "nude"}
+        for label in results:
+            if label['class'] in naughty_labels:
+                return JSONResponse(content={"nude": True})
+        return JSONResponse(content={"nude": False})
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/list_labels")
+async def list_labels():
+    return JSONResponse(content={"all_labels": all_labels, 'naughty_labels': naughty_labels})

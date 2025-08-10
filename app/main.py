@@ -16,9 +16,6 @@ app.include_router(auth.router)
 # Admin UI (guarded by auth dependency inside that module)
 app.include_router(admin.router)
 
-# Netdata reverse proxy (guarded by auth dependency inside that module)
-app.include_router(netdata.router)
-
 # Optional: start background Netdata -> Pushcut watcher if enabled in .env
 mount_monitor(app)
 

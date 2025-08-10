@@ -15,6 +15,61 @@ NGINX_AVAIL="/etc/nginx/sites-available"
 NGINX_ENAB="/etc/nginx/sites-enabled"
 CONF_PATH="$NGINX_AVAIL/$DOMAIN"
 
+# ------------------------------------------------------------------------------
+# Load credentials from project .env (same file your app uses)
+# We resolve it relative to this script's directory to avoid PWD issues.
+# ------------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/.env"
+if [[ -f "$ENV_FILE" ]]; then
+  echo "📄 Loading environment from $ENV_FILE"
+  set -o allexport
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +o allexport
+else
+  echo "⚠️  No .env file found at $ENV_FILE (continuing without env-based auth vars)"
+fi
+
+# ------------------------------------------------------------------------------
+# Optional: Basic auth for /netdata (read from .env if present)
+# Expected keys in .env:
+#   NETDATA_BASIC_USER=monitor
+#   NETDATA_BASIC_PASS=supersecret
+# ------------------------------------------------------------------------------
+ADMIN_USER="${ADMIN_USER:-}"
+ADMIN_PASS="${ADMIN_PASS:-}"
+HTPASSWD_FILE="/etc/nginx/.htpasswd-netdata"
+NEED_BASIC_AUTH=0
+
+if [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
+  NEED_BASIC_AUTH=1
+  echo "🔐 Enabling basic auth on /netdata (user: $ADMIN_USER)"
+  # Ensure htpasswd utility is available
+  if ! command -v htpasswd >/dev/null 2>&1; then
+    echo "📦 Installing apache2-utils for htpasswd..."
+    sudo apt-get update -y
+    sudo apt-get install -y apache2-utils
+  fi
+  # Create/update credentials file
+  sudo mkdir -p "$(dirname "$HTPASSWD_FILE")"
+  if [[ -f "$HTPASSWD_FILE" ]]; then
+    sudo htpasswd -bB "$HTPASSWD_FILE" "$ADMIN_USER" "$ADMIN_PASS" >/dev/null
+  else
+    sudo htpasswd -c -bB "$HTPASSWD_FILE" "$ADMIN_USER" "$ADMIN_PASS" >/dev/null
+  fi
+fi
+
+# Build auth snippet if requested
+AUTH_SNIPPET=""
+if [[ "$NEED_BASIC_AUTH" -eq 1 ]]; then
+  AUTH_SNIPPET=$(cat <<'SNIP'
+        auth_basic "Restricted - Netdata";
+        auth_basic_user_file /etc/nginx/.htpasswd-netdata;
+SNIP
+)
+fi
+
 echo "📄 Writing HTTP (port 80) vhost for $DOMAIN ..."
 sudo tee "$CONF_PATH" >/dev/null <<EOF
 server {
@@ -25,7 +80,22 @@ server {
     # allow larger uploads to the upstream
     client_max_body_size 25M;
 
-    # basic proxy to FastAPI
+    # Dedicated block for Netdata (FastAPI-proxied path)
+    location /netdata/ {
+$AUTH_SNIPPET
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_pass http://127.0.0.1:$PORT/netdata/;
+    }
+
+    # Default proxy to FastAPI
     location / {
         proxy_pass http://127.0.0.1:$PORT;
         proxy_set_header Host \$host;

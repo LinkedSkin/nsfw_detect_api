@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import os
@@ -12,6 +10,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Request, Response, Depends
 from fastapi.responses import HTMLResponse, StreamingResponse
 import httpx
+import re
 from .auth import require_admin
 
 router = APIRouter(dependencies=[Depends(require_admin)])
@@ -61,15 +60,13 @@ def _page(title: str, body: str) -> str:
 
 @router.get("/netdata", response_class=HTMLResponse)
 async def netdata_home():
-    body = '<iframe src="/netdata/ui/index.html"></iframe>'
-    return _page("Netdata", body)
-
-
-@router.api_route("/netdata/ui/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-async def netdata_ui(request: Request, path: str):
-    # Proxy Netdata UI/static assets
-    url = f"{NETDATA_BASE}/{path}"
-    return await _proxy(request, url)
+    # Load Netdata's index via our proxy so we can rewrite paths; fallback to a minimal link
+    try:
+        # This will trigger the generic proxy below with path="index.html"
+        return await netdata_asset(Request({"type": "http"}), path="index.html")  # type: ignore[arg-type]
+    except Exception:
+        body = '<iframe src="/netdata/index.html"></iframe>'
+        return _page("Netdata", body)
 
 
 @router.api_route("/netdata/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
@@ -79,11 +76,22 @@ async def netdata_api(request: Request, path: str):
     return await _proxy(request, url)
 
 
+@router.api_route("/netdata/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def netdata_asset(request: Request, path: str):
+    # Proxy any non-API path directly to Netdata root
+    upstream_path = path or "index.html"
+    url = f"{NETDATA_BASE}/{upstream_path}"
+    return await _proxy(request, url)
+
+
 async def _proxy(request: Request, upstream_url: str) -> Response:
     # Forward method, querystring, and headers (minus hop-by-hop)
     fwd_headers: Dict[str, str] = {
         k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP
     }
+
+    # Avoid compressed upstream so we can safely rewrite HTML
+    fwd_headers.pop("accept-encoding", None)
 
     # Some proxies depend on Host; Netdata doesn't, but it's fine to pass
     # fwd_headers.setdefault("Host", request.headers.get("host", ""))
@@ -103,6 +111,23 @@ async def _proxy(request: Request, upstream_url: str) -> Response:
 
     # Strip hop-by-hop headers from upstream response
     resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP}
+
+    ct = upstream.headers.get("content-type", "").lower()
+    if "text/html" in ct and upstream.content:
+        try:
+            html = upstream.text
+            # Inject a <base> so "/..." paths resolve under /netdata/
+            if "<head" in html and "<base" not in html:
+                html = re.sub(r"(<head[^>]*>)", r"\1\n  <base href=\"/netdata/\">", html, count=1, flags=re.IGNORECASE)
+            # Rewrite absolute-root references to live under /netdata/
+            html = html.replace("href=\"/", "href=\"/netdata/")
+            html = html.replace("src=\"/", "src=\"/netdata/")
+            html = html.replace("action=\"/", "action=\"/netdata/")
+            # Update response headers since body length changed
+            resp_headers.pop("content-length", None)
+            return HTMLResponse(content=html, status_code=upstream.status_code, headers=resp_headers)
+        except Exception:
+            pass
 
     # If content-length exists, return a normal Response, else stream
     if "content-length" in {k.lower(): v for k, v in resp_headers.items()}:

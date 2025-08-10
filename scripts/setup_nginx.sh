@@ -91,7 +91,21 @@ server {
     # allow larger uploads to the upstream
     client_max_body_size 25M;
 
-    # Dedicated block for Netdata (FastAPI-proxied path)
+    # Dedicated block for Netdata served DIRECTLY by nginx (bypass FastAPI)
+    location /netdata/api/ {
+$AUTH_SNIPPET
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s;
+        proxy_buffering off;
+        proxy_pass http://127.0.0.1:19999/api/;
+    }
+
     location /netdata/ {
 $AUTH_SNIPPET
         proxy_http_version 1.1;
@@ -101,12 +115,23 @@ $AUTH_SNIPPET
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_buffering off;
+        proxy_set_header X-Forwarded-Prefix /netdata;
         proxy_read_timeout 300s;
-        proxy_pass http://127.0.0.1:$PORT/netdata/;
+        proxy_buffering off;
+        # Disable upstream compression so sub_filter can work
+        proxy_set_header Accept-Encoding "";
+        proxy_pass http://127.0.0.1:19999/;
+
+        # Rewrite absolute-root references in HTML/JS so the SPA works under /netdata/
+        sub_filter_once off;
+        sub_filter_types text/html application/javascript application/json;
+        sub_filter 'href="/' 'href="/netdata/';
+        sub_filter 'src="/' 'src="/netdata/';
+        sub_filter 'action="/' 'action="/netdata/';
+        sub_filter '"/api/' '"/netdata/api/';
     }
 
-    # Default proxy to FastAPI
+    # Default proxy to FastAPI (app)
     location / {
         proxy_pass http://127.0.0.1:$PORT;
         proxy_set_header Host \$host;

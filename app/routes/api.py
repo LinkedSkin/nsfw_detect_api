@@ -1,5 +1,7 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends
 from fastapi.responses import JSONResponse
+
+from ..utils.rate_limiter import limit_token_or_ip
 
 from ..detector import run_inference, all_labels, naughty_labels
 
@@ -33,7 +35,7 @@ def _upload_from_b64(b64_str: str) -> StarletteUploadFile:
     return StarletteUploadFile(filename="upload", file=bio, content_type=mime)
 
 
-@router.post("/detect")
+@router.post("/detect", dependencies=[Depends(limit_token_or_ip)])
 async def detect(
     file: Optional[UploadFile] = File(None),
     file_b64: Optional[str] = Form(None),
@@ -54,7 +56,7 @@ async def detect(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/isnude")
+@router.post("/isnude", dependencies=[Depends(limit_token_or_ip)])
 async def isnude(
     file: Optional[UploadFile] = File(None),
     file_b64: Optional[str] = Form(None),

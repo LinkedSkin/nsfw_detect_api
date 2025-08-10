@@ -6,7 +6,8 @@ from fastapi import UploadFile
 from nudenet import NudeDetector
 
 # Load NudeNet classifier once at startup
-classifier = NudeDetector()
+path_640 = os.path.join(os.path.dirname(__file__), "640m.onnx")
+classifier = NudeDetector(model_path=path_640, inference_resolution=640)
 
 all_labels = [
     "FEMALE_GENITALIA_COVERED",

@@ -13,6 +13,11 @@ dependencies = [
     "requests>=2.32.4",
     "pillow>=11.3.0",
     "fastapi-login>=1.10.3",
+    "typer>=0.16.0",
+    "python-dotenv>=1.1.1",
+    "sqladmin>=0.21.0",
+    "sqlalchemy>=2.0.42",
+    "aiosqlite>=0.21.0",
 ]
 requires-python = ">=3.12,<3.14"
 readme = "README.md"
@@ -24,7 +29,8 @@ distribution = false
 
 
 [tool.pdm.scripts]
-dev = "fastapi dev app.main:app --port 6969"
+dev = { env = { PYTHONPATH = "." }, cmd = "uvicorn app.main:app --reload --host 0.0.0.0 --port 6969" }
+configure = "python scripts/configure.py"
 serve = "uvicorn app.main:app --host 0.0.0.0 --port 6969"
 test = { env = { PYTHONPATH = "." }, cmd = "pytest" }
 fetch-data = "python tests/get_sample_data.py"

@@ -22,6 +22,7 @@ async def home():
             <a href="/detect_form">Detect (full results)</a>
             <a href="/isnude_form">Is Nude? (boolean)</a>
             <a href="/api/list_labels">Label List</a>
+            <a href="/auth/login_form">Admin</a>
           </nav>
         </main>
       </body>

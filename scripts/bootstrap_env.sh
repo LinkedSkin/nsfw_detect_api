@@ -9,7 +9,19 @@ sudo apt install -y build-essential curl git libssl-dev zlib1g-dev \
   libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev \
   liblzma-dev nginx certbot python3-certbot-nginx
 
-#
+# --- Install Netdata (local monitoring UI at http://127.0.0.1:19999) ---
+echo "📈 Installing Netdata..."
+if ! systemctl is-active --quiet netdata 2>/dev/null; then
+  # Use official kickstart (non-interactive, no telemetry, don't wait)
+  bash <(curl -Ss https://my-netdata.io/kickstart.sh) --disable-telemetry --dont-wait || true
+  # Ensure service is enabled and started
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl enable --now netdata || true
+  fi
+else
+  echo "✔ Netdata already installed and running"
+fi
+
 # Install pyenv
 if [ ! -d "$HOME/.pyenv" ]; then
   echo "📦 Installing pyenv..."
@@ -39,7 +51,7 @@ fi
 '
 for profile in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile" "$HOME/.bash_profile"; do
   if [ -f "$profile" ]; then
-    if ! grep -q 'pyenv initialization' "$profile"; then
+    if ! grep -q 'Pyenv initialization' "$profile"; then
       printf "\n%s\n" "$PYENV_INIT_LINES" >> "$profile"
     fi
   else
@@ -58,7 +70,7 @@ fi
 
 # Install Python 3.13.0
 PYTHON_VERSION="3.13.0"
-if ! pyenv versions --bare | grep -q "^$PYTHON_VERSION\$"; then
+if ! pyenv versions --bare | grep -q "^$PYTHON_VERSION$"; then
   echo "🐍 Installing Python $PYTHON_VERSION..."
   pyenv install "$PYTHON_VERSION"
 fi
@@ -75,4 +87,4 @@ if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-echo "✅ Bootstrap complete. Restart your shell or run: source ~/.bashrc"
+echo "✅ Bootstrap complete. Netdata on http://127.0.0.1:19999. Restart your shell or run: source ~/.bashrc"

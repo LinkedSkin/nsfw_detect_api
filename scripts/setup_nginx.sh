@@ -108,6 +108,9 @@ $AUTH_SNIPPET
 
     location /netdata/ {
 $AUTH_SNIPPET
+        # Ensure /netdata (no trailing slash) redirects to /netdata/
+        rewrite ^/netdata$ /netdata/ permanent;
+
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -118,13 +121,18 @@ $AUTH_SNIPPET
         proxy_set_header X-Forwarded-Prefix /netdata;
         proxy_read_timeout 300s;
         proxy_buffering off;
+
         # Disable upstream compression so sub_filter can work
         proxy_set_header Accept-Encoding "";
+        gzip off;
+
+        # Serve Netdata UI DIRECTLY (bypass FastAPI)
         proxy_pass http://127.0.0.1:19999/;
 
         # Rewrite absolute-root references in HTML/JS so the SPA works under /netdata/
         sub_filter_once off;
-        sub_filter_types text/html application/javascript application/json;
+        # IMPORTANT: do NOT include application/json here (breaks Netdata API responses)
+        sub_filter_types text/html text/css application/javascript text/javascript;
         sub_filter 'href="/' 'href="/netdata/';
         sub_filter 'src="/' 'src="/netdata/';
         sub_filter 'action="/' 'action="/netdata/';

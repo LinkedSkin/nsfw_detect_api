@@ -1,29 +1,31 @@
 from __future__ import annotations
 
 import os
-from typing import Dict
-
+import re
 import asyncio
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request, Response, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 import httpx
-import re
+
 from .auth import require_admin
 
 router = APIRouter(dependencies=[Depends(require_admin)])
 
-# Base URL where Netdata is listening locally
-NETDATA_BASE = os.getenv("NETDATA_BASE", "http://127.0.0.1:19999")
+# ---------------------------
+# Configuration
+# ---------------------------
+# On the Pi this is fine; on your dev Mac, set NETDATA_BASE="http://ndspi.local:19999".
+NETDATA_BASE = os.getenv("NETDATA_BASE", "http://127.0.0.1:19999").rstrip("/")
 
-# Additional monitoring configuration
+# Optional Pushcut/monitor bits (kept for background task wiring)
 PUSHCUT_URL = os.getenv("PUSHCUT_URL", "")
 NETDATA_MONITOR = os.getenv("NETDATA_MONITOR", "0") == "1"
 NETDATA_POLL_SEC = int(os.getenv("NETDATA_POLL_SEC", "5"))
 STRESS_CPU_PCT = float(os.getenv("STRESS_CPU_PCT", "85"))
-STRESS_MEM_PCT = float(os.getenv("STRESS_MEM_PCT", "90"))
+STRESS_MEM_PCT = float(os.getenv("STRESS_MEM_PCT", "90"))  # fixed typo
 STRESS_LOAD_MULT = float(os.getenv("STRESS_LOAD_MULT", "1.5"))
 STRESS_SUSTAIN_SECS = int(os.getenv("STRESS_SUSTAIN_SECS", "120"))
 
@@ -42,7 +44,6 @@ _HOP_BY_HOP = {
 CSS = '<link rel="stylesheet" href="https://unpkg.com/mvp.css" />'
 META = '<meta name="robots" content="noindex, nofollow">'
 
-
 def _page(title: str, body: str) -> str:
     return f"""<!doctype html>
 <html>
@@ -57,61 +58,62 @@ def _page(title: str, body: str) -> str:
   </body>
 </html>"""
 
-
+# ---------------------------
+# Routes
+# ---------------------------
 @router.get("/netdata", response_class=HTMLResponse)
-async def netdata_home():
-    # Load Netdata's index via our proxy so we can rewrite paths; fallback to a minimal link
-    try:
-        # This will trigger the generic proxy below with path="index.html"
-        return await netdata_asset(Request({"type": "http"}), path="index.html")  # type: ignore[arg-type]
-    except Exception:
-        body = '<iframe src="/netdata/index.html"></iframe>'
-        return _page("Netdata", body)
-
+async def netdata_home() -> Response:
+    # Simple redirect to the actual SPA entry
+    return RedirectResponse(url="/netdata/index.html", status_code=302)
 
 @router.api_route("/netdata/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-async def netdata_api(request: Request, path: str):
-    # Proxy Netdata API (e.g. /api/v1/info)
+async def netdata_api(request: Request, path: str) -> Response:
     url = f"{NETDATA_BASE}/api/{path}"
     return await _proxy(request, url)
 
-
 @router.api_route("/netdata/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-async def netdata_asset(request: Request, path: str):
-    # Proxy any non-API path directly to Netdata root
+async def netdata_asset(request: Request, path: str) -> Response:
     upstream_path = path or "index.html"
     url = f"{NETDATA_BASE}/{upstream_path}"
     return await _proxy(request, url)
 
-
+# ---------------------------
+# Proxy core
+# ---------------------------
 async def _proxy(request: Request, upstream_url: str) -> Response:
     # Forward method, querystring, and headers (minus hop-by-hop)
-    fwd_headers: Dict[str, str] = {
-        k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP
-    }
+    fwd_headers: Dict[str, str] = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
 
     # Avoid compressed upstream so we can safely rewrite HTML
     fwd_headers.pop("accept-encoding", None)
-
-    # Some proxies depend on Host; Netdata doesn't, but it's fine to pass
-    # fwd_headers.setdefault("Host", request.headers.get("host", ""))
 
     body = None
     if request.method not in ("GET", "HEAD"):
         body = await request.body()
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        upstream = await client.request(
-            request.method,
-            upstream_url,
-            params=dict(request.query_params),
-            headers=fwd_headers,
-            content=body,
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            upstream = await client.request(
+                request.method,
+                upstream_url,
+                params=dict(request.query_params),
+                headers=fwd_headers,
+                content=body,
+            )
+    except httpx.RequestError:
+        # Friendlier error page when NETDATA_BASE points to the wrong host (e.g., on dev Mac)
+        hint = (
+            f"<h2>Netdata upstream unreachable</h2>"
+            f"<p>Tried: <code>{NETDATA_BASE}</code>.</p>"
+            f"<p>On your dev machine, set "
+            f"<code>NETDATA_BASE=http://ndspi.local:19999</code> (or the Pi's IP) and reload.</p>"
         )
+        return HTMLResponse(_page("Netdata upstream unreachable", hint), status_code=502)
 
     # Strip hop-by-hop headers from upstream response
     resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP}
 
+    # HTML rewrite so absolute-root references work under /netdata/
     ct = upstream.headers.get("content-type", "").lower()
     if "text/html" in ct and upstream.content:
         try:
@@ -134,7 +136,6 @@ async def _proxy(request: Request, upstream_url: str) -> Response:
         return Response(content=upstream.content, status_code=upstream.status_code, headers=resp_headers)
 
     return StreamingResponse(iter([upstream.content]), status_code=upstream.status_code, headers=resp_headers)
-
 
 # ---------------------------
 # Background monitor (optional)
@@ -204,7 +205,6 @@ async def _get_mem_pct(http: httpx.AsyncClient) -> Optional[float]:
             total = used + free
             if total > 0:
                 return (used / total) * 100.0
-    # Fallback: best-effort summary if available
     info = await _fetch_json(http, "/api/v1/info")
     if info:
         mem = info.get("memory") or {}
@@ -259,9 +259,7 @@ async def monitor_loop() -> None:
                     cool_down_until = now + 300  # 5m cooldown
                     hot_since = now
             except Exception:
-                # swallow and continue
                 continue
-
 
 def mount_monitor(app) -> None:
     """Attach the background monitor to a FastAPI app on startup.

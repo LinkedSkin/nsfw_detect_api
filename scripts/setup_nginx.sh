@@ -16,35 +16,46 @@ NGINX_ENAB="/etc/nginx/sites-enabled"
 CONF_PATH="$NGINX_AVAIL/$DOMAIN"
 
 # ------------------------------------------------------------------------------
-# Load credentials from project .env (same file your app uses)
-# We resolve it relative to this script's directory to avoid PWD issues.
+# Load credentials from project .env
+# Prefer project root .env (parent of scripts/) and fall back to common locations
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
-if [[ -f "$ENV_FILE" ]]; then
+ENV_CANDIDATES=(
+  "${SCRIPT_DIR}/../.env"   # project root (parent of scripts)
+  "${SCRIPT_DIR}/.env"      # inside scripts (fallback)
+  "${PWD}/.env"             # current working dir (last resort)
+)
+ENV_FILE=""
+for f in "${ENV_CANDIDATES[@]}"; do
+  if [[ -f "$f" ]]; then
+    ENV_FILE="$f"; break
+  fi
+done
+
+if [[ -n "$ENV_FILE" ]]; then
   echo "📄 Loading environment from $ENV_FILE"
   set -o allexport
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +o allexport
 else
-  echo "⚠️  No .env file found at $ENV_FILE (continuing without env-based auth vars)"
+  echo "⚠️  No .env file found near this script or project root (looked in: ${ENV_CANDIDATES[*]})"
 fi
 
 # ------------------------------------------------------------------------------
 # Optional: Basic auth for /netdata (read from .env if present)
-# Expected keys in .env:
-#   NETDATA_BASIC_USER=monitor
-#   NETDATA_BASIC_PASS=supersecret
+# Supported keys in .env (first match wins):
+#   NETDATA_BASIC_USER / NETDATA_BASIC_PASS
+#   ADMIN_USER / ADMIN_PASS                 (fallback)
 # ------------------------------------------------------------------------------
-ADMIN_USER="${ADMIN_USER:-}"
-ADMIN_PASS="${ADMIN_PASS:-}"
+NETDATA_BASIC_USER="${NETDATA_BASIC_USER:-${ADMIN_USER:-}}"
+NETDATA_BASIC_PASS="${NETDATA_BASIC_PASS:-${ADMIN_PASS:-}}"
 HTPASSWD_FILE="/etc/nginx/.htpasswd-netdata"
 NEED_BASIC_AUTH=0
 
-if [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
+if [[ -n "$NETDATA_BASIC_USER" && -n "$NETDATA_BASIC_PASS" ]]; then
   NEED_BASIC_AUTH=1
-  echo "🔐 Enabling basic auth on /netdata (user: $ADMIN_USER)"
+  echo "🔐 Enabling basic auth on /netdata (user: $NETDATA_BASIC_USER)"
   # Ensure htpasswd utility is available
   if ! command -v htpasswd >/dev/null 2>&1; then
     echo "📦 Installing apache2-utils for htpasswd..."
@@ -54,9 +65,9 @@ if [[ -n "$ADMIN_USER" && -n "$ADMIN_PASS" ]]; then
   # Create/update credentials file
   sudo mkdir -p "$(dirname "$HTPASSWD_FILE")"
   if [[ -f "$HTPASSWD_FILE" ]]; then
-    sudo htpasswd -bB "$HTPASSWD_FILE" "$ADMIN_USER" "$ADMIN_PASS" >/dev/null
+    sudo htpasswd -bB "$HTPASSWD_FILE" "$NETDATA_BASIC_USER" "$NETDATA_BASIC_PASS" >/dev/null
   else
-    sudo htpasswd -c -bB "$HTPASSWD_FILE" "$ADMIN_USER" "$ADMIN_PASS" >/dev/null
+    sudo htpasswd -c -bB "$HTPASSWD_FILE" "$NETDATA_BASIC_USER" "$NETDATA_BASIC_PASS" >/dev/null
   fi
 fi
 

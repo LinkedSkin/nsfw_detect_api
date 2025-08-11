@@ -1,25 +1,24 @@
-
-
 """
-Simple, in-memory rate limiting utilities for FastAPI.
+Rate limiting utilities for FastAPI using the `limits` library.
 
 Goal:
 - If a **valid API token** is provided: use a **higher per-token** limit.
 - Otherwise (public/anonymous): use a **lower per-IP** limit.
 
-This module is process-local (perfect for a single Raspberry Pi / single Uvicorn worker).
-If you scale horizontally, switch to a shared store (e.g., Redis) for counters.
+This module is process-local (good for a single Raspberry Pi / single Uvicorn worker).
+If you scale across multiple processes or hosts, switch to a shared store (e.g., Redis)
+by replacing MemoryStorage with RedisStorage.
 """
-from __future__ import annotations
-
 import os
-import time
-from collections import deque
-from threading import Lock
-from typing import Deque, Dict, Tuple, Optional
+from typing import Optional
 
 from fastapi import HTTPException, Request, Header
 from sqlalchemy import create_engine, text
+
+# limits imports
+from limits import parse
+from limits.storage import MemoryStorage
+from limits.strategies import MovingWindowRateLimiter
 
 # -----------------------
 # Configuration (env vars)
@@ -33,30 +32,15 @@ WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 # API tokens DB URL (must match admin UI)
 TOKENS_DB_URL = os.getenv("TOKENS_DB_URL", "sqlite:///./api_tokens.db")
 
-# Use a deque per key for O(1) appends and amortized O(1) cleanup
-_Buckets: Dict[Tuple[str, str], Deque[float]] = {}
-_LOCK = Lock()
+# Build rate strings consumable by `limits.parse` (e.g., "5/10 seconds")
+IP_RATE = parse(f"{IP_LIMIT}/{WINDOW} seconds")
+TOKEN_RATE = parse(f"{TOKEN_LIMIT}/{WINDOW} seconds")
+
+# Storage/strategy: in-memory moving window (per-process)
+_storage = MemoryStorage()
+_limiter = MovingWindowRateLimiter(_storage)
+
 _tokens_engine = create_engine(TOKENS_DB_URL, connect_args={"check_same_thread": False})
-
-
-def _consume(key: Tuple[str, str], limit: int, window: int) -> None:
-    """Consume one request from the bucket for `key`.
-
-    Raises HTTPException(429) if limit exceeded.
-    """
-    now = time.time()
-    cutoff = now - window
-    with _LOCK:
-        bucket = _Buckets.get(key)
-        if bucket is None:
-            bucket = deque()
-            _Buckets[key] = bucket
-        # drop timestamps older than window
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= limit:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
-        bucket.append(now)
 
 
 def _extract_token(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
@@ -81,6 +65,15 @@ def _is_valid_token(token: str) -> bool:
     return bool(row[0])
 
 
+def _hit_or_429(rate_item, key: str) -> None:
+    """Consume one request for `key` against `rate_item`; raise 429 if exceeded."""
+    # `hit` returns True when within the limit, False when exceeded
+    allowed = _limiter.hit(rate_item, key)
+    if not allowed:
+        # Optionally you could compute retry-after via `get_window_stats` if desired
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+
 # -----------------------
 # Dependencies
 # -----------------------
@@ -91,22 +84,21 @@ async def limit_token_or_ip(
 ) -> None:
     """Conditional limiter for public endpoints.
 
-    - If a valid API token is present → apply TOKEN_LIMIT per token.
-    - Otherwise → apply IP_LIMIT per IP.
+    - If a valid API token is present → apply TOKEN_RATE per token.
+    - Otherwise → apply IP_RATE per IP.
     """
     token = _extract_token(x_api_key, authorization)
     if token and _is_valid_token(token):
-        _consume(("tok", token), TOKEN_LIMIT, WINDOW)
+        _hit_or_429(TOKEN_RATE, f"tok:{token}")
         return
     # Anonymous path: limit by IP
     ip = request.client.host if request.client else "unknown"
-    _consume(("ip", ip), IP_LIMIT, WINDOW)
+    _hit_or_429(IP_RATE, f"ip:{ip}")
 
 
-# Optional strict helpers if you want to use them elsewhere
 async def limit_by_ip(request: Request) -> None:
     ip = request.client.host if request.client else "unknown"
-    _consume(("ip", ip), IP_LIMIT, WINDOW)
+    _hit_or_429(IP_RATE, f"ip:{ip}")
 
 
 async def limit_by_token(
@@ -116,4 +108,4 @@ async def limit_by_token(
     token = _extract_token(x_api_key, authorization)
     if not token or not _is_valid_token(token):
         raise HTTPException(status_code=401, detail="Valid API token required")
-    _consume(("tok", token), TOKEN_LIMIT, WINDOW)
+    _hit_or_429(TOKEN_RATE, f"tok:{token}")

@@ -19,6 +19,7 @@ dependencies = [
     "sqlalchemy>=2.0.42",
     "aiosqlite>=0.21.0",
     "httpx[http2]>=0.28.1",
+    "limits>=5.5.0",
 ]
 requires-python = ">=3.12,<3.14"
 readme = "README.md"

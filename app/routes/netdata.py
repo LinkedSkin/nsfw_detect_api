@@ -1,17 +1,14 @@
-from __future__ import annotations
-
 import os
-import re
 import asyncio
 import time
 import logging
 from typing import Any, Dict, Optional
+try:
+    import fcntl
+except Exception:
+    fcntl = None
 
-from fastapi import APIRouter, Request, Response, Depends
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 import httpx
-
-from .auth import require_admin
 
 # --------------------------------------------------------------------------------------
 # Logging / diagnostics
@@ -29,7 +26,7 @@ PUSHCUT_URL = os.getenv("PUSHCUT_URL", "")
 NETDATA_MONITOR = os.getenv("NETDATA_MONITOR", "0") == "1"
 NETDATA_POLL_SEC = int(os.getenv("NETDATA_POLL_SEC", "5"))
 STRESS_CPU_PCT = float(os.getenv("STRESS_CPU_PCT", "85"))
-STRESS_MEM_PCT = float(os.getenv("STRESS_MEM_PCT", "90"))  # fixed typo
+STRESS_MEM_PCT = float(os.getenv("STRESS_MEM_PCT", "90"))
 STRESS_LOAD_MULT = float(os.getenv("STRESS_LOAD_MULT", "1.5"))
 STRESS_SUSTAIN_SECS = int(os.getenv("STRESS_SUSTAIN_SECS", "120"))
 
@@ -37,180 +34,6 @@ logger.info(
     "[NETDATA] base=%s monitor=%s poll=%ss cpu>=%.0f mem>=%.0f load*%.2f",
     NETDATA_BASE, NETDATA_MONITOR, NETDATA_POLL_SEC, STRESS_CPU_PCT, STRESS_MEM_PCT, STRESS_LOAD_MULT
 )
-
-# Hop-by-hop headers must not be forwarded by proxies per RFC 7230 §6.1
-_HOP_BY_HOP = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-}
-
-CSS = '<link rel="stylesheet" href="https://unpkg.com/mvp.css" />'
-META = '<meta name="robots" content="noindex, nofollow">'
-
-router = APIRouter(dependencies=[Depends(require_admin)])
-
-
-def _page(title: str, body: str) -> str:
-    return f"""<!doctype html>
-<html>
-  <head>
-    <title>{title}</title>
-    {META}
-    {CSS}
-    <style>html,body,iframe{{height:100%;width:100%;margin:0;border:0}}</style>
-  </head>
-  <body>
-    {body}
-  </body>
-</html>"""
-
-
-# --------------------------------------------------------------------------------------
-# Routes
-# --------------------------------------------------------------------------------------
-@router.get("/netdata", response_class=HTMLResponse)
-async def netdata_home() -> Response:
-    logger.debug("/netdata → redirect → /netdata/index.html")
-    return RedirectResponse(url="/netdata/index.html", status_code=302)
-
-
-# Some older links (or an unfixed admin page) might still request /netdata/ui/index.html
-@router.get("/netdata/ui/index.html", response_class=HTMLResponse)
-async def netdata_ui_compat() -> Response:
-    logger.debug("/netdata/ui/index.html → redirect → /netdata/index.html")
-    return RedirectResponse(url="/netdata/index.html", status_code=302)
-
-
-@router.api_route("/netdata/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-async def netdata_api(request: Request, path: str) -> Response:
-    url = f"{NETDATA_BASE}/api/{path}"
-    return await _proxy(request, url, reason="api")
-
-
-@router.api_route("/netdata/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-async def netdata_asset(request: Request, path: str) -> Response:
-    upstream_path = path or "index.html"
-    url = f"{NETDATA_BASE}/{upstream_path}"
-    return await _proxy(request, url, reason="asset")
-
-
-# --------------------------------------------------------------------------------------
-# Proxy core
-# --------------------------------------------------------------------------------------
-async def _proxy(request: Request, upstream_url: str, *, reason: str) -> Response:
-    # Forward method, querystring, and headers (minus hop-by-hop)
-    fwd_headers: Dict[str, str] = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
-
-    # Avoid compressed upstream so we can safely rewrite HTML
-    fwd_headers.pop("accept-encoding", None)
-
-    body = None
-    if request.method not in ("GET", "HEAD"):
-        body = await request.body()
-
-    logger.debug(
-        "[proxy] %s %s → %s qs=%s headers=%s",
-        request.method, request.url.path, upstream_url,
-        dict(request.query_params),
-        {k: v for k, v in fwd_headers.items() if k.lower() in ("accept", "content-type", "user-agent")}
-    )
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            upstream = await client.request(
-                request.method,
-                upstream_url,
-                params=dict(request.query_params),
-                headers=fwd_headers,
-                content=body,
-            )
-    except httpx.RequestError as e:
-        logger.error("[proxy] upstream error for %s: %s", upstream_url, e)
-        hint = (
-            f"<h2>Netdata upstream unreachable</h2>"
-            f"<p>Tried: <code>{NETDATA_BASE}</code>.</p>"
-            f"<p>On your dev machine, set <code>NETDATA_BASE=http://ndspi.local:19999</code> "
-            f"(or the Pi's IP) and reload.</p>"
-        )
-        return HTMLResponse(_page("Netdata upstream unreachable", hint), status_code=502)
-
-    ct = upstream.headers.get("content-type", "").lower()
-    clen = upstream.headers.get("content-length")
-    logger.debug("[proxy] upstream %s %s ct=%s len=%s", upstream.status_code, reason, ct, clen or "?")
-
-    # Strip hop-by-hop headers from upstream response
-    resp_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP}
-
-    # HTML rewrite so absolute-root references work under /netdata/
-    if "text/html" in ct and upstream.content:
-        try:
-            html = upstream.text
-            modified = False
-            # Inject a <base> so "/..." paths resolve under /netdata/
-            if "<head" in html and "<base" not in html:
-                html = re.sub(r"(<head[^>]*>)", r"\1\n  <base href=\"/netdata/\">", html, count=1, flags=re.IGNORECASE)
-                modified = True
-            # Rewrite absolute-root references to live under /netdata/
-            rep_html = html.replace("href=\"/", "href=\"/netdata/")
-            rep_html = rep_html.replace("src=\"/", "src=\"/netdata/")
-            rep_html = rep_html.replace("action=\"/", "action=\"/netdata/")
-            if rep_html != html:
-                html = rep_html
-                modified = True
-
-            # Inject a client-side shim to rewrite fetch/XHR/WebSocket calls to /api/* → /netdata/api/*
-            shim = (
-                "\n<script>\n(function(){\n"
-                "  var prefix = '/netdata';\n"
-                "  var origFetch = window.fetch;\n"
-                "  window.fetch = function(input, init){\n"
-                "    try{\n"
-                "      var url = (typeof input === 'string') ? input : input.url;\n"
-                "      if (url && url.startsWith('/api/')) url = prefix + url;\n"
-                "      if (typeof input === 'string') return origFetch(url, init);\n"
-                "      var req = new Request(url, input);\n"
-                "      return origFetch(req, init);\n"
-                "    }catch(e){ return origFetch(input, init); }\n"
-                "  };\n"
-                "  var origOpen = XMLHttpRequest.prototype.open;\n"
-                "  XMLHttpRequest.prototype.open = function(method, url){\n"
-                "    try{ if (typeof url === 'string' && url.startsWith('/api/')) url = prefix + url; }catch(e){}\n"
-                "    return origOpen.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));\n"
-                "  };\n"
-                "  var OrigWS = window.WebSocket;\n"
-                "  window.WebSocket = function(url, protocols){\n"
-                "    try{ if (typeof url === 'string' && url.startsWith('/api/')) url = prefix + url; }catch(e){}\n"
-                "    return protocols ? new OrigWS(url, protocols) : new OrigWS(url);\n"
-                "  };\n"
-                "})();\n</script>\n"
-            )
-            if "</head>" in html.lower():
-                # Insert right before closing head
-                html = re.sub(r"</head>", shim + "</head>", html, flags=re.IGNORECASE)
-                modified = True
-            else:
-                html += shim
-                modified = True
-
-            if modified:
-                resp_headers.pop("content-length", None)
-                logger.debug("[proxy] HTML rewritten and shim injected")
-                return HTMLResponse(content=html, status_code=upstream.status_code, headers=resp_headers)
-        except Exception as e:
-            logger.warning("[proxy] HTML rewrite failed: %s", e)
-
-    # If content-length exists, return a normal Response, else stream
-    if "content-length" in {k.lower(): v for k, v in resp_headers.items()}:
-        return Response(content=upstream.content, status_code=upstream.status_code, headers=resp_headers)
-
-    return StreamingResponse(iter([upstream.content]), status_code=upstream.status_code, headers=resp_headers)
-
 
 # --------------------------------------------------------------------------------------
 # Background monitor (optional)
@@ -338,7 +161,6 @@ async def monitor_loop() -> None:
             except Exception as e:
                 logger.debug("[monitor] loop error: %s", e)
                 continue
-
 
 def mount_monitor(app) -> None:
     """Attach the background monitor to a FastAPI app on startup.

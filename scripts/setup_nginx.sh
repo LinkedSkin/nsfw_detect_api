@@ -194,13 +194,23 @@ fi)
     # Included locations live in: $SNIPPET_PATH
     include $SNIPPET_PATH;
 
-    # --- Everything else → FastAPI app ---
+    # --- FastAPI upstream (increase proxy timeouts to avoid 504 under load) ---
     location / {
-        proxy_pass http://127.0.0.1:$PORT;
+        # Connection & upstream timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    300s;
+        proxy_read_timeout    300s;   # key for preventing 504s while app is computing
+        send_timeout          300s;
+
+        # HTTP/1.1 & forward real client IPs (important for rate limiting)
+        proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # Upstream FastAPI service
+        proxy_pass http://127.0.0.1:$PORT;
     }
 }
 EOF
@@ -210,14 +220,14 @@ if [[ -e "/etc/nginx/sites-enabled/default" ]]; then
   rm -f /etc/nginx/sites-enabled/default
 fi
 
-# Enable site, test, reload/restart
 ln -sf "$CONF_PATH" "$NGINX_ENAB/$DOMAIN"
 
-echo "🔄 Testing NGINX config ..."; nginx -t
-
-echo "🔁 Reloading NGINX ..."; systemctl reload nginx || true
-
-echo "🔁 Restarting NGINX ..."; systemctl restart nginx
+echo "🔄 Testing NGINX config ...";
+nginx -t
+echo "🔁 Reloading NGINX ...";
+systemctl reload nginx
+echo "🔁 Restarting NGINX ...";
+systemctl restart nginx
 
 echo "✅ NGINX configured for $DOMAIN"
 echo "ℹ️  Netdata is proxied at: https://$DOMAIN/netdata/  (and http://$DOMAIN/netdata/)"

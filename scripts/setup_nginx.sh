@@ -7,11 +7,16 @@ set -euo pipefail
 #  - Load creds from project .env
 #  - Create/Update /etc/nginx/.htpasswd-netdata using NETDATA_BASIC_* or ADMIN_*
 #  - Create /etc/nginx/snippets/netdata_locations.conf with /netdata locations
-#  - Write HTTP vhost that includes the snippet
-#  - Run Certbot (force reinstall/renew) to create/update the HTTPS vhost
-#  - Patch the HTTPS vhost to also include the snippet
+#  - Write BOTH HTTP (80) and HTTPS (443) vhosts that include the snippet
+#  - Obtain/renew certs with Certbot (certonly, no nginx edits)
 #  - Test, reload, and restart nginx
 # ------------------------------------------------------------------------------
+
+# Require root (sudo)
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  echo "❌ Please run as root (use: sudo $0 <domain>)" >&2
+  exit 1
+fi
 
 DOMAIN="${1:-}"
 if [[ -z "$DOMAIN" ]]; then
@@ -28,6 +33,9 @@ CONF_PATH="$NGINX_AVAIL/$DOMAIN"
 SNIPPETS_DIR="/etc/nginx/snippets"
 SNIPPET_PATH="$SNIPPETS_DIR/netdata_locations.conf"
 HTPASSWD_FILE="/etc/nginx/.htpasswd-netdata"
+LE_LIVE_DIR="/etc/letsencrypt/live/$DOMAIN"
+FULLCHAIN="$LE_LIVE_DIR/fullchain.pem"
+PRIVKEY="$LE_LIVE_DIR/privkey.pem"
 
 # ------------------------------------------------------------------------------
 # Load environment from project .env (prefer project root ../.env)
@@ -128,17 +136,56 @@ $AUTH_LINES
 SNIP
 
 # ------------------------------------------------------------------------------
-# Write minimal HTTP vhost that includes the snippet
-# Certbot will add HTTPS; we will then ensure the snippet is included there too.
+# Obtain/renew certs WITHOUT letting certbot edit nginx configs
+# (we manage the vhost ourselves; certbot only gets/renews certs)
+# ------------------------------------------------------------------------------
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-admin@$DOMAIN}"
+if [[ ! -f "$FULLCHAIN" || ! -f "$PRIVKEY" ]]; then
+  echo "🔐 Obtaining certificate with Certbot (certonly) ..."
+  certbot certonly --nginx \
+    -d "$DOMAIN" -d "$ALT_DOMAIN" \
+    --agree-tos -m "$CERTBOT_EMAIL" --non-interactive || {
+    echo "❗ Certbot encountered an issue obtaining certs.";
+  }
+else
+  echo "🔐 Renewing certificate with Certbot (force-renewal) ..."
+  certbot renew --force-renewal --cert-name "$DOMAIN" || true
+fi
+
+# If certs still missing, continue with HTTP-only config (will still work)
+if [[ ! -f "$FULLCHAIN" || ! -f "$PRIVKEY" ]]; then
+  echo "⚠️  TLS certs not found at $LE_LIVE_DIR — continuing with HTTP; rerun after certs exist."
+fi
+
+# ------------------------------------------------------------------------------
+# Write BOTH HTTP and HTTPS vhosts; include the snippet in BOTH.
 # ------------------------------------------------------------------------------
 mkdir -p "$NGINX_AVAIL" "$NGINX_ENAB"
 
-echo "📄 Writing HTTP (port 80) vhost for $DOMAIN ..."
+echo "📄 Writing vhosts for $DOMAIN ..."
 tee "$CONF_PATH" >/dev/null <<EOF
+# =====================  HTTP vhost (80)  =====================
 server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN $ALT_DOMAIN;
+
+    # Redirect everything to HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+# =====================  HTTPS vhost (443)  =====================
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN $ALT_DOMAIN;
+
+$(if [[ -f "$FULLCHAIN" && -f "$PRIVKEY" ]]; then cat <<SSL
+    # TLS certificates
+    ssl_certificate $FULLCHAIN;
+    ssl_certificate_key $PRIVKEY;
+SSL
+fi)
 
     # Allow larger uploads to your FastAPI app (tune if needed)
     client_max_body_size 25M;
@@ -158,65 +205,21 @@ server {
 }
 EOF
 
-# ------------------------------------------------------------------------------
+# Disable default site to prevent conflicts
+if [[ -e "/etc/nginx/sites-enabled/default" ]]; then
+  rm -f /etc/nginx/sites-enabled/default
+fi
+
 # Enable site, test, reload/restart
-# ------------------------------------------------------------------------------
 ln -sf "$CONF_PATH" "$NGINX_ENAB/$DOMAIN"
 
 echo "🔄 Testing NGINX config ..."; nginx -t
+
 echo "🔁 Reloading NGINX ..."; systemctl reload nginx || true
+
 echo "🔁 Restarting NGINX ..."; systemctl restart nginx
 
-# ------------------------------------------------------------------------------
-# Certbot: always (re)install + renew; then ensure HTTPS vhost includes snippet
-# ------------------------------------------------------------------------------
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-admin@$DOMAIN}"
-echo "🔐 Running Certbot (force reinstall/renew) ..."
-certbot --nginx \
-  -d "$DOMAIN" -d "$ALT_DOMAIN" \
-  --agree-tos -m "$CERTBOT_EMAIL" --non-interactive \
-  --redirect --reinstall --force-renewal || {
-  echo "❗ Certbot encountered an issue. You can re-run this script after fixing it.";
-}
-
-# After Certbot has created/updated the 443 server block in $CONF_PATH,
-# ensure it also includes our Netdata snippet (idempotent patch).
-if ! awk '
-  $0 ~ /server_name/ && $0 ~ /'"$DOMAIN"'/ { in_server=1 }
-  in_server && $0 ~ /listen[^;]*443/ { in_tls=1 }
-  in_server && $0 ~ /include[[:space:]]+'"$SNIPPET_PATH"'/ { has_include=1 }
-  in_server && $0 ~ /}/ { if (in_tls && !has_include) exit 2; in_server=0; in_tls=0; has_include=0 }
-  END { if (in_tls && !has_include) exit 2 }
-' "$CONF_PATH"; then
-  echo "🧩 Injecting snippet into 443 server block in $CONF_PATH"
-  # Insert the include line right after the server_name line inside the 443 block
-  # This sed is careful to only modify the 443 server that matches our domain.
-  sed -i -E '
-    /server[[:space:]]*\\{/{
-      :srv
-      N
-      /\\}/!b srv
-    }
-  ' "$CONF_PATH"  # (no-op grouping to keep sed portable)
-
-  # Simpler targeted insert: add include after the first occurrence of server_name within a 443 block
-  awk -v domain="$DOMAIN" -v snippet="$SNIPPET_PATH" '
-    BEGIN{in=0;tls=0;done=0}
-    /server[[:space:]]*\\{/ {blk=blk $0 ORS; in=1; tls=0; next}
-    in && /listen[^;]*443/ {tls=1}
-    in && tls && !done && $0 ~ ("server_name[[:space:]].*" domain) {
-      print blk $0 ORS "    include " snippet ";"
-      blk=""; in=0; tls=0; done=1; next
-    }
-    in {blk=blk $0 ORS; if ($0 ~ /}/) {print blk; blk=""; in=0; tls=0; next}}
-    !in {print}
-  ' "$CONF_PATH" > "$CONF_PATH.tmp" && mv "$CONF_PATH.tmp" "$CONF_PATH"
-fi
-
-echo "🔄 Final NGINX test ..."; nginx -t
-echo "🔁 Final NGINX restart ..."; systemctl restart nginx
-
-echo "✅ NGINX + Certbot configured for $DOMAIN"
+echo "✅ NGINX configured for $DOMAIN"
 echo "ℹ️  Netdata is proxied at: https://$DOMAIN/netdata/  (and http://$DOMAIN/netdata/)"
 if [[ $HAVE_AUTH -eq 1 ]]; then
   echo "🔒 Basic Auth enabled (user: $NETDATA_BASIC_USER)"

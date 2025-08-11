@@ -30,9 +30,9 @@ distribution = false
 
 
 [tool.pdm.scripts]
-dev = { env = { PYTHONPATH = "." }, cmd = "uvicorn app.main:app --reload --host 0.0.0.0 --port 6969" }
+dev = { env = { PYTHONPATH = "." }, cmd = "uvicorn app.main:app --reload --host 0.0.0.0 --port ${PORT:-6969}" }
 configure = "python scripts/configure.py"
-serve = "uvicorn app.main:app --host 0.0.0.0 --port 6969"
+serve = { env = { PYTHONPATH = "." }, cmd = "bash -lc 'W=${SERVE_WORKERS:-$(python - <<\"PY\"\nimport multiprocessing as mp\nw = mp.cpu_count() or 1\n# Choose a reasonable default: between 2 and 4 workers depending on cores\nw = max(2, min(4, w))\nprint(w)\nPY\n)}; echo Using $W workers; uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-6969} --workers $W --proxy-headers --forwarded-allow-ips=\"*\" --timeout-keep-alive 75 --backlog 2048'" }
 test = { env = { PYTHONPATH = "." }, cmd = "pytest" }
 fetch-data = "python tests/get_sample_data.py"
 lock-matrix = { env = { PDM_IGNORE_ACTIVE_VENV = "1" }, cmd = "bash -lc 'pdm lock --python 3.13 --platform macos_arm64 && pdm lock --append --python 3.13 --platform macos_x86_64 && pdm lock --append --python 3.12 --platform manylinux_2_36_x86_64 && pdm lock --append --python 3.12 --platform manylinux_2_36_aarch64'" }

@@ -2,20 +2,32 @@ import os
 import asyncio
 import time
 import logging
+import contextlib
 from typing import Any, Dict, Optional
+
 try:
-    import fcntl
-except Exception:
+    import fcntl  # POSIX-only; used for cross-process leader lock
+except Exception:  # pragma: no cover
     fcntl = None
 
 import httpx
 
+# Try to expose a minimal FastAPI router (optional; guarded)
+try:  # Prevent hard import failures if FastAPI/auth aren’t available at import time
+    from fastapi import APIRouter, Depends
+    try:
+        from .auth import require_admin  # adjust if module path differs
+        router = APIRouter(dependencies=[Depends(require_admin)])
+    except Exception:  # fallback: public router (unused, but keeps imports stable)
+        router = APIRouter()
+except Exception:  # if FastAPI is not importable in this context
+    router = None  # type: ignore
+
 # --------------------------------------------------------------------------------------
 # Logging / diagnostics
 # --------------------------------------------------------------------------------------
-logger = logging.getLogger("netdata_proxy")
+logger = logging.getLogger("netdata_monitor")
 if not logger.handlers:
-    # Use DEBUG by setting NETDATA_DEBUG=1 in .env
     logger.setLevel(logging.DEBUG if os.getenv("NETDATA_DEBUG", "0") == "1" else logging.INFO)
 
 # --------------------------------------------------------------------------------------
@@ -34,6 +46,34 @@ logger.info(
     "[NETDATA] base=%s monitor=%s poll=%ss cpu>=%.0f mem>=%.0f load*%.2f",
     NETDATA_BASE, NETDATA_MONITOR, NETDATA_POLL_SEC, STRESS_CPU_PCT, STRESS_MEM_PCT, STRESS_LOAD_MULT
 )
+
+# --------------------------------------------------------------------------------------
+# Single-leader control for the monitor (avoid duplicate pushes across workers)
+# --------------------------------------------------------------------------------------
+_monitor_task: Optional[asyncio.Task] = None
+_monitor_lock_fd: Optional[int] = None
+_LEADER_LOCK_PATH = "/tmp/netdata_monitor.lock"
+
+
+def _try_acquire_leader_lock(path: str = _LEADER_LOCK_PATH) -> bool:
+    """Try to become the single monitor leader using an exclusive flock.
+    Returns True if this process acquired the lock, False otherwise.
+    On non-POSIX (no fcntl), fall back to per-process (return True).
+    """
+    global _monitor_lock_fd
+    if fcntl is None:
+        # Non-POSIX: best-effort single instance per process
+        logger.info("[monitor] fcntl not available; proceeding without cross-process lock")
+        return True
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _monitor_lock_fd = fd
+        logger.info("[monitor] acquired leader lock at %s", path)
+        return True
+    except Exception:
+        logger.info("[monitor] another process holds the leader lock at %s; skipping here", path)
+        return False
 
 # --------------------------------------------------------------------------------------
 # Background monitor (optional)
@@ -160,15 +200,43 @@ async def monitor_loop() -> None:
                     hot_since = now
             except Exception as e:
                 logger.debug("[monitor] loop error: %s", e)
+                await asyncio.sleep(1.0)
                 continue
+
 
 def mount_monitor(app) -> None:
     """Attach the background monitor to a FastAPI app on startup.
 
-    Will only start if NETDATA_MONITOR=1 and PUSHCUT_URL is set.
+    Only one monitor loop will run across all worker processes via flock.
     """
+    global _monitor_task, _monitor_lock_fd
+
     @app.on_event("startup")
     async def _start_monitor():  # type: ignore[unused-variable]
-        if NETDATA_MONITOR and PUSHCUT_URL:
-            logger.info("[monitor] starting background monitor loop")
-            asyncio.create_task(monitor_loop())
+        global _monitor_task
+        if not (NETDATA_MONITOR and PUSHCUT_URL):
+            logger.info("[monitor] disabled (NETDATA_MONITOR=%s, PUSHCUT_URL set=%s)", NETDATA_MONITOR, bool(PUSHCUT_URL))
+            return
+        if _monitor_task and not _monitor_task.done():
+            logger.debug("[monitor] already running in this process")
+            return
+        if _try_acquire_leader_lock():
+            logger.info("[monitor] starting background monitor loop (leader)")
+            _monitor_task = asyncio.create_task(monitor_loop())
+        else:
+            # Do not start the loop in this worker
+            pass
+
+    @app.on_event("shutdown")
+    async def _stop_monitor():  # type: ignore[unused-variable]
+        global _monitor_task, _monitor_lock_fd
+        if _monitor_task and not _monitor_task.done():
+            _monitor_task.cancel()
+            with contextlib.suppress(Exception):
+                await _monitor_task
+            _monitor_task = None
+        if _monitor_lock_fd is not None and fcntl is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(_monitor_lock_fd, fcntl.LOCK_UN)
+                os.close(_monitor_lock_fd)
+            _monitor_lock_fd = None

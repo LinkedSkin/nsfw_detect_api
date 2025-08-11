@@ -36,7 +36,7 @@ def _upload_from_b64(b64_str: str) -> StarletteUploadFile:
 
 
 @router.post("/detect", dependencies=[Depends(limit_token_or_ip)])
-async def detect(
+def detect(
     file: Optional[UploadFile] = File(None),
     file_b64: Optional[str] = Form(None),
 ):
@@ -57,7 +57,7 @@ async def detect(
 
 
 @router.post("/isnude", dependencies=[Depends(limit_token_or_ip)])
-async def isnude(
+def isnude(
     file: Optional[UploadFile] = File(None),
     file_b64: Optional[str] = Form(None),
 ):

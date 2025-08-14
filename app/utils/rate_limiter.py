@@ -1,46 +1,115 @@
 """
 Rate limiting utilities for FastAPI using the `limits` library.
 
-Goal:
-- If a **valid API token** is provided: use a **higher per-token** limit.
-- Otherwise (public/anonymous): use a **lower per-IP** limit.
+Behavior:
+- If a **valid API token** is provided: apply a **higher per-token** limit.
+- Otherwise (public/anonymous): apply a **lower per-IP** limit.
 
-This module is process-local (good for a single Raspberry Pi / single Uvicorn worker).
-If you scale across multiple processes or hosts, switch to a shared store (e.g., Redis)
-by replacing MemoryStorage with RedisStorage.
+Fixes vs previous version:
+- Storage is configurable via RATE_LIMIT_STORAGE_URL (default: memory://).
+  Use redis for multi-worker: RATE_LIMIT_STORAGE_URL=redis://localhost:6379/0
+- Rates are computed from env at **call time** so .env changes (or late load) apply.
 """
+
 import os
-from typing import Optional
+import time
+import json
+import fcntl
+import tempfile
+from typing import Optional, Tuple
 
 from fastapi import HTTPException, Request, Header
 from sqlalchemy import create_engine, text
 
-# limits imports
 from limits import parse
-from limits.storage import MemoryStorage
+from limits.storage import storage_from_string
 from limits.strategies import MovingWindowRateLimiter
 
 # -----------------------
-# Configuration (env vars)
+# Custom file-based rate limiter for multi-worker support
 # -----------------------
-# Anonymous requests per window (by IP)
-IP_LIMIT = int(os.getenv("RATE_LIMIT_IP_PER_MIN", "30"))
-# Authenticated requests per window (by token)
-TOKEN_LIMIT = int(os.getenv("RATE_LIMIT_TOKEN_PER_MIN", "300"))
-# Window size in seconds
-WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+class FileRateLimiter:
+    """File-based rate limiter that works across multiple workers."""
+    
+    def __init__(self, filepath):
+        self.filepath = filepath
+    
+    def is_allowed(self, key: str, limit: int, window: int) -> bool:
+        """Check if request is allowed and record it."""
+        now = time.time()
+        cutoff = now - window
+        
+        # Use file locking for thread/process safety
+        try:
+            with open(self.filepath, 'r+') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    data = json.load(f)
+                except (json.JSONDecodeError, ValueError):
+                    data = {}
+                
+                # Clean old entries and count recent ones
+                if key not in data:
+                    data[key] = []
+                
+                # Remove old timestamps
+                data[key] = [ts for ts in data[key] if ts > cutoff]
+                
+                # Check if we're within limit
+                if len(data[key]) >= limit:
+                    return False
+                
+                # Record this request
+                data[key].append(now)
+                
+                # Write back
+                f.seek(0)
+                json.dump(data, f)
+                f.truncate()
+                
+                return True
+                
+        except FileNotFoundError:
+            # Create file if it doesn't exist
+            with open(self.filepath, 'w') as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                json.dump({key: [now]}, f)
+            return True
+
+# Storage backend (configurable)
+def _get_rate_limiter():
+    """Get rate limiter. Use file-based for multi-worker support without external deps."""
+    storage_url = os.getenv("RATE_LIMIT_STORAGE_URL")
+    
+    if storage_url and storage_url != "memory://":
+        # Use limits library with specified storage
+        storage = storage_from_string(storage_url)
+        return MovingWindowRateLimiter(storage), False
+    else:
+        # Use custom file-based limiter
+        rate_limit_file = os.path.join(tempfile.gettempdir(), "nsfw_api_rate_limits.json")
+        return FileRateLimiter(rate_limit_file), True
+
+_limiter, _is_file_limiter = _get_rate_limiter()
+
 # API tokens DB URL (must match admin UI)
 TOKENS_DB_URL = os.getenv("TOKENS_DB_URL", "sqlite:///./api_tokens.db")
-
-# Build rate strings consumable by `limits.parse` (e.g., "5/10 seconds")
-IP_RATE = parse(f"{IP_LIMIT}/{WINDOW} seconds")
-TOKEN_RATE = parse(f"{TOKEN_LIMIT}/{WINDOW} seconds")
-
-# Storage/strategy: in-memory moving window (per-process)
-_storage = MemoryStorage()
-_limiter = MovingWindowRateLimiter(_storage)
-
 _tokens_engine = create_engine(TOKENS_DB_URL, connect_args={"check_same_thread": False})
+
+
+def _current_rates() -> Tuple[object, object]:
+    """Read limits from env each call and return parsed rate objects.
+    Env knobs:
+      RATE_LIMIT_IP_PER_MIN (default 30)
+      RATE_LIMIT_TOKEN_PER_MIN (default 300)
+      RATE_LIMIT_WINDOW_SEC (default 60)
+    """
+    ip_limit = int(os.getenv("RATE_LIMIT_IP_PER_MIN", "30"))
+    token_limit = int(os.getenv("RATE_LIMIT_TOKEN_PER_MIN", "300"))
+    window = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+    ip_rate = parse(f"{ip_limit}/{window} seconds")
+    token_rate = parse(f"{token_limit}/{window} seconds")
+    return ip_rate, token_rate
 
 
 def _extract_token(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
@@ -67,11 +136,19 @@ def _is_valid_token(token: str) -> bool:
 
 def _hit_or_429(rate_item, key: str) -> None:
     """Consume one request for `key` against `rate_item`; raise 429 if exceeded."""
-    # `hit` returns True when within the limit, False when exceeded
-    allowed = _limiter.hit(rate_item, key)
-    if not allowed:
-        # Optionally you could compute retry-after via `get_window_stats` if desired
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    if _is_file_limiter:
+        # Extract limit and window from rate_item string representation
+        rate_str = str(rate_item)  # e.g., "2 per 60 second"
+        parts = rate_str.split()
+        limit = int(parts[0])
+        window = int(parts[2])
+        
+        if not _limiter.is_allowed(key, limit, window):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    else:
+        # Use limits library limiter
+        if not _limiter.hit(rate_item, key):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
 # -----------------------
@@ -84,28 +161,32 @@ async def limit_token_or_ip(
 ) -> None:
     """Conditional limiter for public endpoints.
 
-    - If a valid API token is present → apply TOKEN_RATE per token.
-    - Otherwise → apply IP_RATE per IP.
+    - If a valid API token is present → apply TOKEN rate per token.
+    - Otherwise → apply IP rate per IP.
     """
+    ip_rate, token_rate = _current_rates()
+
     token = _extract_token(x_api_key, authorization)
     if token and _is_valid_token(token):
-        _hit_or_429(TOKEN_RATE, f"tok:{token}")
+        _hit_or_429(token_rate, f"tok:{token}")
         return
     # Anonymous path: limit by IP
     ip = request.client.host if request.client else "unknown"
-    _hit_or_429(IP_RATE, f"ip:{ip}")
+    _hit_or_429(ip_rate, f"ip:{ip}")
 
 
 async def limit_by_ip(request: Request) -> None:
+    ip_rate, _ = _current_rates()
     ip = request.client.host if request.client else "unknown"
-    _hit_or_429(IP_RATE, f"ip:{ip}")
+    _hit_or_429(ip_rate, f"ip:{ip}")
 
 
 async def limit_by_token(
     x_api_key: Optional[str] = Header(None, convert_underscores=False),
     authorization: Optional[str] = Header(None),
 ) -> None:
+    _, token_rate = _current_rates()
     token = _extract_token(x_api_key, authorization)
     if not token or not _is_valid_token(token):
         raise HTTPException(status_code=401, detail="Valid API token required")
-    _hit_or_429(TOKEN_RATE, f"tok:{token}")
+    _hit_or_429(token_rate, f"tok:{token}")
